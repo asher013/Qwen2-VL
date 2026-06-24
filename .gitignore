@@ -1,0 +1,15 @@
+Images/
+
+generated_outputs/
+
+qwen2vl_2b_env/Include/
+qwen2vl_2b_env/Lib/
+qwen2vl_2b_env/Scripts/
+qwen2vl_2b_env/share/
+qwen2vl_2b_env/pyvenv.cfg
+
+!qwen2vl_2b_env/**/*.py
+!qwen2vl_2b_env/**/*.ipynb
+!qwen2vl_2b_env/**/*.sh
+!qwen2vl_2b_env/**/*.json
+!qwen2vl_2b_env/**/*.md
