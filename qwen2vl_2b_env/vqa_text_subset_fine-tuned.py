@@ -2,11 +2,13 @@ import os
 os.environ["PYTHONUTF8"] = "1"
 os.environ["WANDB_DISABLED"] = "true"
 
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
+import json
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, Qwen2VLProcessor, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
+from PIL import Image
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -21,10 +23,10 @@ print(f"Using device: {device}")
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 EPOCHS = 1
-BATCH_SIZE = 1
-GRADIENT_CHECKPOINTING = True,  # Tradeoff between memory efficiency and computation time.
-USE_REENTRANT = False,
-OPTIM = "paged_adamw_32bit"
+BATCH_SIZE = 4
+GRADIENT_CHECKPOINTING = True  # Tradeoff between memory efficiency and computation time.
+USE_REENTRANT = False
+OPTIM = "paged_adamw_8bit" # saves memory compared to adamw_torch or paged_adamw_32bit
 LEARNING_RATE = 2e-5
 LOGGING_STEPS = 50
 EVAL_STEPS = 50
@@ -37,7 +39,7 @@ MAX_GRAD_NORM = 1
 WARMUP_STEPS = 0
 DATASET_KWARGS={"skip_prepare_dataset": True} # We have to put for VLMs
 REMOVE_UNUSED_COLUMNS = False # VLM thing
-MAX_SEQ_LEN=128
+MAX_SEQ_LEN=256 
 NUM_STEPS = (283 // BATCH_SIZE) * EPOCHS
 print(f"NUM_STEPS: {NUM_STEPS}")
 
@@ -48,30 +50,39 @@ Do not provide summaries or interpretations unless explicitly requested by the u
 Only respond in short answers (2-3 words) and do not elaborate or use captions for the images.
 """
 
+def aggregate_answers(answers):
+    confidence_weights = {"yes": 1.0, "maybe": 0.5, "no": 0.25}
+    answer_scores = {}
+    for a in answers:
+        ans = a["answer"].strip().lower()
+        weight = confidence_weights[a["answer_confidence"]]
+        answer_scores[ans] = answer_scores.get(ans, 0) + weight
+    return max(answer_scores, key=answer_scores.get)
 
 def format_data(sample):
+    target_answer = aggregate_answers(sample["answers"])
     return [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": system_message}],
-        },
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": "Images\\val\\val\\"+sample["image"],
-                },
-                {
-                    "type": "text",
-                    "text": sample["question"],
-                },
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": sample["answers"]}],
-        },
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": system_message}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": "Images\\val\\val\\"+sample["image"],
+                    },
+                    {
+                        "type": "text",
+                        "text": sample["question"],
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": target_answer}],
+            },
     ]
 
 def text_generator(sample_data):
@@ -99,18 +110,21 @@ def text_generator(sample_data):
     # actual_answer = sample_data[2]["content"][0]["text"]
     return sample_data[1]["content"][1]["text"], output_text[0], image_inputs
 
-
+# ========== MODEL CREATION =================
 if device == "cuda":
+    """
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16
     )
+    """
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         MODEL_ID, 
         device_map="auto", 
-        quantization_config=bnb_config
+        torch_dtype=torch.bfloat16,
+        # quantization_config=bnb_config
         )
 
 else:
@@ -123,7 +137,8 @@ else:
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 processor.tokenizer.padding_side = "right"
 
-dataset = load_dataset("json", data_files="Annotations\\val_text.json")
+# ======== DATASET IMPORT AND CONSTRUCTION ============
+dataset = load_dataset("json",data_files="Annotations\\val_text.json")
 train_dataset = dataset["train"]
 
 train_test = train_dataset.train_test_split(test_size=0.2, seed=42)
@@ -139,7 +154,8 @@ train_dataset = [format_data(sample) for sample in train_dataset]
 eval_dataset = [format_data(sample) for sample in eval_dataset]
 test_dataset = [format_data(sample) for sample in test_dataset]
 
-"""with open("generated_outputs/generated_outputs[text_recognition].txt", "w", encoding='utf-8') as f:
+
+with open("generated_outputs/generated_outputs[text_recognition].txt", "w", encoding='utf-8') as f:
     f.write("="*25)
     f.write("SYSTEM MESSAGE") 
     f.write("="*25)
@@ -151,7 +167,8 @@ test_dataset = [format_data(sample) for sample in test_dataset]
     f.write("\n")
 
 
-# Serialized version of text output
+# ========= PRE-TRAINING EVALUATION ===========
+"""
 for i in range(100):
     user_question, generated_text, img = text_generator(train_dataset[i])
     print(f"Writing to file...")
@@ -161,25 +178,28 @@ for i in range(100):
     torch.cuda.empty_cache()
 """
 
-# ======== FINE-TUNING STAGE =============
+# ======== PARAMETER-EFFICIENT FINE-TUNING | Low-Rank Adaptation Configuration ===========
 peft_config = LoraConfig(
-    lora_alpha = 16,
-    lora_dropout=0.1,
-    r=8,
+    lora_alpha = 32,
+    lora_dropout=0.05,
+    r=16,
     bias='none',
-    target_modules=['q_proj', 'v_proj'],
+    target_modules=['q_proj', 'v_proj', 'k_proj', 'o_proj'],
     task_type='CAUSAL_LM',
 )
 
 print(f"Before adapter parameters: {model.num_parameters()}")
-peft_model = get_peft_model(model, peft_config)
+"""peft_model = get_peft_model(model, peft_config)
 peft_model.print_trainable_parameters()
+"""
 
+# ============ SUPERVISED FINE-TUNING CONFIGURATION ====================
 training_args = SFTConfig(
     output_dir = "./output",
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=4,
     gradient_checkpointing=GRADIENT_CHECKPOINTING,
     learning_rate=LEARNING_RATE,
     logging_steps=LOGGING_STEPS,
@@ -193,38 +213,38 @@ training_args = SFTConfig(
     warmup_steps=WARMUP_STEPS,
     dataset_kwargs=DATASET_KWARGS,
     max_length=MAX_SEQ_LEN,
+    max_steps=5,
     remove_unused_columns=REMOVE_UNUSED_COLUMNS,
     optim=OPTIM,
 )
 
 collate_sample = [train_dataset[0], train_dataset[1]]
 
+# ============= COLLATING AND STANDARDIZING DATA FOR LLM TRAINING =================
 def collate_fn(examples):
     texts = [processor.apply_chat_template(example, tokenize=False) for example in examples]
-    image_inputs = [example[1]["content"][0]["image"] for example in examples]
+    image_inputs = [Image.open(example[1]["content"][0]["image"]).convert("RGB") for example in examples]
+    answers = [example[2]["content"][0]["text"] for example in examples]
 
     batch = processor(text=texts, images=image_inputs, return_tensors="pt", padding=True)
-    labels = batch['input_ids'].clone()
-    for i, text in enumerate(texts):
-        assistant_start = text.find("<|im_start|>assistant")
-        if assistant_start != -1:
-            token_idx = len(processor.tokenizer.encode(text[:assistant_start]))
-            labels[i,:token_idx] = -100
-    #labels[labels==processor.tokenizer.pad_token_id] = -100
+    labels = torch.full_like(batch['input_ids'], -100)
+    
+    for i, answer in enumerate(answers):
+        answer_ids = processor.tokenizer(answer, add_special_tokens=False)["input_ids"]
+        input_ids = batch["input_ids"][i].tolist()
+        
+        for start in range(len(input_ids) - len(answer_ids) + 1):
+            if input_ids[start:start + len(answer_ids)] == answer_ids:
+                labels[i, start:start + len(answer_ids)] = batch["input_ids"][i, start:start + len(answer_ids)]
+                break
+    
     batch["labels"] = labels
-
     return batch
-"""
+
 collated_data = collate_fn(collate_sample)
 print(collated_data.keys())
-"""
 
-print(type(train_dataset))        # Should be Dataset, not list
-print(type(train_dataset[0]))     # Should be dict
-print(train_dataset[0])           # Print the full first entry
-print(train_dataset.column_names) # Show all available column names
-
-"""
+# ======== SUPERVISED FINE-TUNING TRAINER ==============
 trainer = SFTTrainer(
     model=model,
     args=training_args,
@@ -232,16 +252,27 @@ trainer = SFTTrainer(
     eval_dataset=eval_dataset,
     data_collator=collate_fn,
     peft_config=peft_config,
-    processing_class=processor.tokenizer,
+    processing_class=processor,
 )
 
+sample_batch = collate_fn([train_dataset[0], train_dataset[1]])
+print("Labels shape:", sample_batch["labels"].shape)
+print("Non-ignored tokens:", (sample_batch["labels"] != -100).sum().item())
+print("Labels:", sample_batch["labels"][0][:50])
+print("Input IDs:", sample_batch["input_ids"][0][:50])
+
+non_masked = sample_batch["labels"][0][sample_batch["labels"][0] != -100]
+print(processor.tokenizer.decode(non_masked))
+
+# =========== TRAINER EVALUATION ====================
+"""
 print("-"*30)
 print("Initial Evaluation")
 metric = trainer.evaluate()
 print(metric)
 print("-"*30)
-
+"""
+torch.cuda.empty_cache()
 print("Training")
 trainer.train()
 print("-"*30)
-"""
